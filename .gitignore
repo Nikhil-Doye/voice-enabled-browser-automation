@@ -1,0 +1,17 @@
+node_modules/
+pnpm-lock.yaml
+
+__pycache__/
+.venv/
+.env
+*.pyc
+
+artifacts/
+*.log
+
+dist/
+build/
+
+.vscode/
+.idea/
+.DS_Store
