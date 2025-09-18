@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 
 type Line = { text: string; final: boolean; kind?: "info" | "warn" | "error" };
 
+// ------------ Audio helpers (unchanged core) ------------
 function floatTo16BitPCM(float32: Float32Array) {
   const out = new Int16Array(float32.length);
   for (let i = 0; i < float32.length; i++) {
@@ -45,7 +46,6 @@ async function createMicWorklet(
         const input = inputs[0];
         if (input && input[0]) {
           const ch = input[0];
-          // copy to transferable buffer
           const data = new Float32Array(ch.length);
           data.set(ch);
           this.port.postMessage(data, [data.buffer]);
@@ -74,23 +74,74 @@ async function createMicWorklet(
 
   const src = ctx.createMediaStreamSource(stream);
   src.connect(node);
-  // keep graph alive (silent path)
-  node.connect(ctx.destination);
+  node.connect(ctx.destination); // keep the graph alive (silent)
 
   return node;
+}
+
+// ------------ Tiny inline icons (no external packages) ------------
+function IconMic({ muted }: { muted?: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      className="h-5 w-5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+    >
+      <path d="M12 1a3 3 0 0 0-3 3v7a3 3 0 1 0 6 0V4a3 3 0 0 0-3-3Z" />
+      <path d="M19 10v1a7 7 0 0 1-14 0v-1" />
+      <path d="M12 19v4" />
+      <path d="M8 23h8" />
+      {muted ? <path d="M4 4l16 16" /> : null}
+    </svg>
+  );
+}
+function IconBroom() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      className="h-5 w-5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+    >
+      <path d="M15 3l6 6M8 10l6 6M4 20l6-6" />
+      <path d="M3 21c3-3 7-1 10-4l-6-6C4 14 6 18 3 21Z" />
+    </svg>
+  );
+}
+function StatusBadge({ connected }: { connected: boolean }) {
+  return (
+    <span
+      className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-medium ring-1 ${
+        connected
+          ? "bg-green-100 text-green-700 ring-green-200"
+          : "bg-gray-100 text-gray-600 ring-gray-200"
+      }`}
+    >
+      <span
+        className={`h-2 w-2 rounded-full ${
+          connected ? "bg-green-500" : "bg-gray-400"
+        }`}
+      />
+      {connected ? "connected" : "disconnected"}
+    </span>
+  );
 }
 
 export function App() {
   const [connected, setConnected] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [lines, setLines] = useState<Line[]>([]);
+  const [level, setLevel] = useState(0); // simple RMS meter 0..1
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const workletRef = useRef<AudioWorkletNode | null>(null);
   const keepaliveTimer = useRef<number | null>(null);
 
-  // batching aggregator (bundle small worklet frames into ~50–60ms packets)
+  // batching aggregator (bundle small worklet frames into ~60ms packets)
   const aggRef = useRef<{
     buf: Float32Array;
     lastSend: number;
@@ -179,9 +230,16 @@ export function App() {
 
     const worklet = await createMicWorklet(ctx, stream);
 
-    // batch frames from worklet, resample→PCM16→send every ~60ms
+    // batch frames from worklet, resample→PCM16→send every ~60ms and compute RMS level
     worklet.port.onmessage = (e: MessageEvent<Float32Array>) => {
       const input = e.data;
+
+      // update a simple audio level meter (RMS with slight decay)
+      let sum = 0;
+      for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+      const rms = Math.sqrt(sum / input.length);
+      setLevel((prev) => Math.max(rms, prev * 0.85));
+
       const agg = aggRef.current;
       const merged = new Float32Array(agg.buf.length + input.length);
       merged.set(agg.buf);
@@ -246,63 +304,128 @@ export function App() {
     pushInfo("microphone_stopped");
   }
 
+  function clearTranscript() {
+    setLines([]);
+  }
+
+  // ---- UI ----
   return (
-    <div style={{ fontFamily: "system-ui, Segoe UI, Arial", padding: 16 }}>
-      <h1>Voice Web Agent – Live Transcript</h1>
-
-      <div
-        style={{
-          marginBottom: 12,
-          display: "flex",
-          gap: 12,
-          alignItems: "center",
-        }}
-      >
-        <button onClick={isRecording ? stop : start}>
-          {isRecording ? "Stop" : "Start mic"}
-        </button>
-        <span>Status: {connected ? "connected" : "disconnected"}</span>
-      </div>
-
-      <div
-        style={{
-          border: "1px solid #ddd",
-          padding: 12,
-          borderRadius: 8,
-          maxHeight: 320,
-          overflow: "auto",
-        }}
-      >
-        {lines.length === 0 ? (
-          <i>No transcripts yet…</i>
-        ) : (
-          lines.map((l, i) => (
-            <div
-              key={i}
-              style={{
-                padding: "4px 0",
-                borderBottom: "1px dashed #eee",
-                color:
-                  l.kind === "warn"
-                    ? "#b58900"
-                    : l.kind === "error"
-                    ? "#dc322f"
-                    : undefined,
-                fontWeight: l.final && !l.kind ? 600 : 400,
-                opacity: !l.kind && !l.final ? 0.6 : 1,
-                whiteSpace: "pre-wrap",
-              }}
-            >
-              {l.kind ? `[${l.kind}] ${l.text}` : l.text}
+    <div className="min-h-screen bg-gradient-to-b from-white to-slate-50 text-slate-900">
+      {/* Top bar */}
+      <header className="sticky top-0 z-10 border-b bg-white/70 backdrop-blur">
+        <div className="mx-auto max-w-6xl px-4 py-3 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="h-8 w-8 rounded-xl bg-indigo-600 text-white grid place-items-center shadow-sm">
+              VA
             </div>
-          ))
-        )}
-      </div>
+            <div>
+              <h1 className="text-lg font-semibold leading-5">
+                Voice Web Agent
+              </h1>
+              <p className="text-xs text-slate-500">
+                Live transcription with Deepgram
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <StatusBadge connected={connected} />
+            <button
+              onClick={isRecording ? stop : start}
+              className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium shadow-sm ring-1 transition
+              ${
+                isRecording
+                  ? "bg-rose-600 text-white ring-rose-700 hover:bg-rose-700"
+                  : "bg-indigo-600 text-white ring-indigo-700 hover:bg-indigo-700"
+              }`}
+              title={isRecording ? "Stop microphone" : "Start microphone"}
+            >
+              <IconMic muted={!isRecording} />
+              {isRecording ? "Stop" : "Start"}
+            </button>
+            <button
+              onClick={clearTranscript}
+              className="inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium bg-white hover:bg-slate-50 ring-1 ring-slate-200 text-slate-700"
+              title="Clear transcript"
+            >
+              <IconBroom />
+              Clear
+            </button>
+          </div>
+        </div>
+      </header>
 
-      <p style={{ color: "#666", fontSize: 12, marginTop: 12 }}>
-        Uses <code>AudioWorkletNode</code> to batch &amp; resample mic audio to
-        16&nbsp;kHz PCM16 before streaming.
-      </p>
+      {/* Content */}
+      <main className="mx-auto max-w-6xl px-4 py-6 grid md:grid-cols-3 gap-6">
+        {/* Transcript panel */}
+        <section className="md:col-span-2 rounded-2xl border bg-white shadow-sm">
+          <div className="border-b px-4 py-3 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-slate-700">Transcript</h2>
+            <span className="text-xs text-slate-500">
+              finals in bold, partials dimmed
+            </span>
+          </div>
+          <div className="p-4 h-[60vh] overflow-auto space-y-2">
+            {lines.length === 0 ? (
+              <div className="h-full grid place-items-center text-slate-500 italic">
+                No transcripts yet…
+              </div>
+            ) : (
+              lines.map((l, i) => (
+                <div
+                  key={i}
+                  className={`rounded-lg px-3 py-2 ring-1 ${
+                    l.kind === "error"
+                      ? "bg-red-50 ring-red-100 text-red-700"
+                      : l.kind === "warn"
+                      ? "bg-amber-50 ring-amber-100 text-amber-800"
+                      : "bg-white ring-slate-200 text-slate-800"
+                  }`}
+                  style={{ opacity: !l.kind && !l.final ? 0.7 : 1 }}
+                >
+                  <span
+                    className={`${
+                      l.final && !l.kind ? "font-semibold" : "font-normal"
+                    }`}
+                  >
+                    {l.kind ? `[${l.kind}] ${l.text}` : l.text}
+                  </span>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
+
+        {/* Right column: mic meter & tips */}
+        <aside className="rounded-2xl border bg-white shadow-sm p-4">
+          <h3 className="text-sm font-semibold text-slate-700 mb-3">
+            Microphone
+          </h3>
+          <div className="mb-4">
+            <div className="h-3 w-full rounded-full bg-slate-100 overflow-hidden ring-1 ring-slate-200">
+              <div
+                className="h-full bg-indigo-500 transition-[width] duration-75"
+                style={{ width: `${Math.min(100, Math.round(level * 200))}%` }}
+              />
+            </div>
+            <div className="mt-1 text-xs text-slate-500">Input level</div>
+          </div>
+          <div className="rounded-xl bg-slate-50 ring-1 ring-slate-200 p-3 text-xs text-slate-600 space-y-1">
+            <div>
+              WS: <code>ws://127.0.0.1:7071/stream</code>
+            </div>
+            <div>
+              Format: <code>PCM16 • 16 kHz • mono</code>
+            </div>
+            <div>
+              Model: <code>{import.meta.env.VITE_DG_MODEL ?? "nova-3"}</code>
+            </div>
+          </div>
+          <div className="mt-4 text-xs text-slate-500">
+            Tip: partial lines update in place; final lines are bolded. Use
+            “Clear” to reset the panel.
+          </div>
+        </aside>
+      </main>
     </div>
   );
 }
