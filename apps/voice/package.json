@@ -12,6 +12,7 @@
     "format": "echo \"(add prettier later)\""
   },
   "dependencies": {
+    "@deepgram/sdk": "^4.11.2",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "ws": "^8.18.0"
