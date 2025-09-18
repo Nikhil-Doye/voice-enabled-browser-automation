@@ -1,62 +1,67 @@
-import WebSocket, { RawData } from "ws";
+import {
+  createClient,
+  LiveClient,
+  LiveTranscriptionEvents,
+} from "@deepgram/sdk";
 
 export type DeepgramClientOptions = {
   apiKey: string;
-  model?: string; // "nova-3" etc.
-  language?: string; // "en"
-  interimResults?: boolean; // partials
+  model?: string; // e.g. "nova-3"
+  language?: string; // e.g. "en"
+  interimResults?: boolean;
 };
 
 export type DeepgramClient = {
-  socket: WebSocket;
+  live: LiveClient;
   sendAudio: (chunk: Buffer | ArrayBuffer | Uint8Array) => void;
-  close: () => void;
+  close: () => Promise<void>;
 };
 
-export function connectDeepgram(
+// Connect via Deepgram SDK Live client
+export async function connectDeepgram(
   opts: DeepgramClientOptions,
-  onMessage: (msg: any) => void,
-  onClose?: () => void
+  onMessage: (msg: unknown) => void,
+  onState?: (type: "open" | "close" | "error", info?: unknown) => void
 ): Promise<DeepgramClient> {
   const {
     apiKey,
     model = "nova-3",
-    language = "en",
+    language = "en-US",
     interimResults = true,
   } = opts;
 
-  const url = new URL("wss://api.deepgram.com/v1/listen");
-  url.searchParams.set("model", model);
-  url.searchParams.set("language", language);
-  if (interimResults) url.searchParams.set("punctuate", "true");
+  const dg = createClient(apiKey);
 
-  return new Promise((resolve, reject) => {
-    const dg = new WebSocket(url.toString(), {
-      headers: { Authorization: `Token ${apiKey}` },
-    });
-
-    dg.on("open", () => {
-      resolve({
-        socket: dg,
-        sendAudio: (chunk) => {
-          if (dg.readyState === WebSocket.OPEN) dg.send(chunk);
-        },
-        close: () => dg.close(),
-      });
-    });
-
-    dg.on("message", (data: RawData) => {
-      try {
-        const json = JSON.parse(String(data));
-        onMessage(json);
-      } catch {
-        // ignore non-JSON frames
-      }
-    });
-
-    dg.on("error", (err: Error) => reject(err));
-    dg.on("close", () => {
-      onClose?.();
-    });
+  // IMPORTANT: We declare encoding & sample rate to match our UI stream (PCM16 @ 16kHz mono)
+  const live = await dg.listen.live({
+    model,
+    language,
+    encoding: "linear16",
+    sample_rate: 16000,
+    channels: 1,
+    interim_results: interimResults,
+    punctuate: true,
+    smart_format: true,
   });
+
+  // Wire SDK events to our callbacks
+  live.on(LiveTranscriptionEvents.Open, () => onState?.("open"));
+  live.on(LiveTranscriptionEvents.Close, () => onState?.("close"));
+  live.on(LiveTranscriptionEvents.Error, (e) => onState?.("error", e));
+  live.on(LiveTranscriptionEvents.Transcript, (data) => onMessage(data));
+
+  return {
+    live,
+    sendAudio: (chunk) => {
+      // SDK expects ArrayBuffer/TypedArray/Buffer
+      live.send(chunk as any);
+    },
+    close: async () => {
+      try {
+        await live.disconnect();
+      } catch {
+        /* ignore */
+      }
+    },
+  };
 }

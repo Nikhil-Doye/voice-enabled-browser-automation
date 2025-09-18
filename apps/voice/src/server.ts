@@ -1,19 +1,16 @@
+// apps/voice/src/server.ts
 import dotenv from "dotenv";
+import path from "node:path";
 import express from "express";
 import type { Server as HttpServer } from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
 import { connectDeepgram } from "./deepgram.js";
 import { fileURLToPath } from "node:url";
-import path from "node:path";
 
-(
-  // 1) Load from the app folder (apps/voice/.env)
-  (dotenv.config())
-);
-(
-  // 2) Also try to load from the repo root (.env) as a fallback
-  (dotenv.config({ path: path.resolve(process.cwd(), "..", "..", ".env") }))
-);
+// Load .env from app and repo root (app values take precedence)
+dotenv.config(); // apps/voice/.env (if present)
+dotenv.config({ path: path.resolve(process.cwd(), "..", "..", ".env") }); // repo-root .env fallback
+
 export type VoiceServer = {
   http: HttpServer;
   wss: WebSocketServer;
@@ -25,14 +22,20 @@ export async function startVoiceServer(opts?: {
   deepgramApiKey?: string | null;
 }): Promise<VoiceServer> {
   const PORT = Number(opts?.port ?? process.env.VOICE_PORT ?? 7071);
-  const DEEPGRAM_API_KEY = opts?.deepgramApiKey ?? process.env.DEEPGRAM_API_KEY ?? null;
+  const DEEPGRAM_API_KEY =
+    opts?.deepgramApiKey ?? process.env.DEEPGRAM_API_KEY ?? null;
 
   if (!DEEPGRAM_API_KEY) {
-    console.warn("[voice] DEEPGRAM_API_KEY not set. The server will accept connections but won't transcribe.");
+    console.warn(
+      "[voice] DEEPGRAM_API_KEY not set. The server will accept connections but won't transcribe."
+    );
   }
 
   const app = express();
-  app.get("/health", (_req, res) => res.json({ status: "ok", service: "voice", version: "0.1.0" }));
+  app.get("/health", (_req, res) =>
+    res.json({ status: "ok", service: "voice", version: "0.1.0" })
+  );
+
   const http = await new Promise<HttpServer>((resolve) => {
     const s = app.listen(PORT, () => {
       console.log(`[voice] http/ws listening on http://127.0.0.1:${PORT}`);
@@ -54,36 +57,70 @@ export async function startVoiceServer(opts?: {
     if (DEEPGRAM_API_KEY) {
       try {
         state.dg = await connectDeepgram(
-          { apiKey: DEEPGRAM_API_KEY, model: process.env.DEEPGRAM_MODEL ?? "nova-2", language: "en" },
-          (msg) => ws.send(JSON.stringify({ type: "deepgram", payload: msg })),
-          () => { if (!state.closed) ws.send(JSON.stringify({ type: "info", payload: "deepgram_closed" })); }
+          {
+            apiKey: DEEPGRAM_API_KEY,
+            model: process.env.DEEPGRAM_MODEL ?? "nova-3",
+            language: "en-US",
+            interimResults: true,
+          },
+          // onMessage: forward partial/final with explicit types
+          (msg: any) => {
+            const isFinal = msg?.is_final || msg?.channel?.is_final;
+            ws.send(
+              JSON.stringify({
+                type: isFinal ? "transcript_final" : "transcript_partial",
+                payload: msg,
+              })
+            );
+          },
+          // onState
+          (type, info) => {
+            if (!state.closed) {
+              ws.send(
+                JSON.stringify({ type: "info", payload: { state: type, info } })
+              );
+            }
+          }
         );
-        ws.send(JSON.stringify({ type: "info", payload: "deepgram_connected" }));
+        ws.send(
+          JSON.stringify({ type: "info", payload: "deepgram_connected" })
+        );
       } catch (err: any) {
         console.error("[voice] deepgram connect failed:", err?.message ?? err);
-        ws.send(JSON.stringify({ type: "error", payload: "deepgram_connect_failed" }));
+        ws.send(
+          JSON.stringify({ type: "error", payload: "deepgram_connect_failed" })
+        );
       }
     } else {
-      ws.send(JSON.stringify({ type: "warn", payload: "no_api_key; running in passthrough" }));
+      ws.send(
+        JSON.stringify({
+          type: "warn",
+          payload: "no_api_key; running in passthrough",
+        })
+      );
     }
 
     ws.on("message", (data: WebSocket.RawData) => {
+      // Expect raw PCM16 16k mono bytes from the browser UI
       if (Buffer.isBuffer(data)) {
         state.dg?.sendAudio(data);
       } else {
+        // Optional JSON control frames
         try {
           const msg = JSON.parse(String(data));
           if (msg?.type === "close") {
-            state.dg?.close();
+            state.dg?.close(); // graceful finish()
             ws.close();
           }
-        } catch { /* ignore */ }
+        } catch {
+          // ignore non-JSON control messages
+        }
       }
     });
 
     ws.on("close", () => {
       state.closed = true;
-      state.dg?.close();
+      state.dg?.close().catch(() => void 0);
       console.log("[voice] client disconnected");
     });
   });
@@ -96,15 +133,14 @@ export async function startVoiceServer(opts?: {
         wss.close(() => {
           http.close(() => resolve());
         });
-      })
+      }),
   };
 }
 
-// If invoked directly (pnpm --filter voice dev), boot the server.
-// Use a Windows-safe comparison between this module and argv[1].
+// Robust "am I main?" check (Windows-safe)
 const isMain = (() => {
   try {
-    const thisFile = fileURLToPath(import.meta.url);        
+    const thisFile = fileURLToPath(import.meta.url);
     const argv1 = process.argv[1] ? path.resolve(process.argv[1]) : "";
     return path.normalize(thisFile) === path.normalize(argv1);
   } catch {
