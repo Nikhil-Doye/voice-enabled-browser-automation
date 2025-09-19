@@ -1,0 +1,18 @@
+import OpenAI from "openai";
+const BASE_URL = process.env.LLM_BASE_URL || "https://api.openai.com";
+const API_KEY = process.env.LLM_API_KEY || "";
+const MODEL = process.env.LLM_MODEL || "gpt-4o-mini";
+if (!API_KEY) {
+    console.warn("[brain-ts] LLM_API_KEY not set — /parse will fail until you add it to .env");
+}
+export const client = new OpenAI({ apiKey: API_KEY, baseURL: BASE_URL });
+export async function callLLMJSON(messages) {
+    const res = await client.chat.completions.create({
+        model: MODEL,
+        temperature: 0.1,
+        response_format: { type: "json_object" },
+        messages,
+    });
+    const content = res.choices?.[0]?.message?.content || "{}";
+    return JSON.parse(content);
+}

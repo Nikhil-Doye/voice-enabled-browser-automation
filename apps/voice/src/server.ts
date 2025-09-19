@@ -6,10 +6,50 @@ import type { Server as HttpServer } from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
 import { connectDeepgram } from "./deepgram.js";
 import { fileURLToPath } from "node:url";
+import http from "node:http";
 
 // Load .env from app and repo root (app values take precedence)
 dotenv.config(); // apps/voice/.env (if present)
 dotenv.config({ path: path.resolve(process.cwd(), "..", "..", ".env") }); // repo-root .env fallback
+
+function postJsonAndReturn(url: string, body: unknown): Promise<any> {
+  return new Promise((resolve, reject) => {
+    try {
+      const u = new URL(url);
+      const data = Buffer.from(JSON.stringify(body));
+      const req = http.request(
+        {
+          hostname: u.hostname,
+          port:
+            (u.port && Number(u.port)) || (u.protocol === "https:" ? 443 : 80),
+          path: u.pathname + (u.search || ""),
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": data.length,
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            const buf = Buffer.concat(chunks).toString("utf8");
+            try {
+              resolve(JSON.parse(buf));
+            } catch {
+              resolve({ ok: false });
+            }
+          });
+        }
+      );
+      req.on("error", reject);
+      req.write(data);
+      req.end();
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
 
 export type VoiceServer = {
   http: HttpServer;
@@ -36,22 +76,25 @@ export async function startVoiceServer(opts?: {
     res.json({ status: "ok", service: "voice", version: "0.1.0" })
   );
 
-  const http = await new Promise<HttpServer>((resolve) => {
+  const httpServer = await new Promise<HttpServer>((resolve) => {
     const s = app.listen(PORT, () => {
       console.log(`[voice] http/ws listening on http://127.0.0.1:${PORT}`);
       resolve(s);
     });
   });
 
-  const wss = new WebSocketServer({ server: http, path: "/stream" });
+  const wss = new WebSocketServer({ server: httpServer, path: "/stream" });
 
   type ClientState = {
     dg?: Awaited<ReturnType<typeof connectDeepgram>>;
     closed?: boolean;
+    context: Record<string, any>;
+    pendingText?: string;
+    debounce?: NodeJS.Timeout;
   };
 
   wss.on("connection", async (ws: WebSocket) => {
-    const state: ClientState = {};
+    const state: ClientState = { context: {} };
     console.log("[voice] client connected");
 
     if (DEEPGRAM_API_KEY) {
@@ -63,17 +106,72 @@ export async function startVoiceServer(opts?: {
             language: "en-US",
             interimResults: true,
           },
-          // onMessage: forward partial/final with explicit types
+          // onMessage from Deepgram
           (msg: any) => {
             const isFinal = msg?.is_final || msg?.channel?.is_final;
+
             ws.send(
               JSON.stringify({
                 type: isFinal ? "transcript_final" : "transcript_partial",
                 payload: msg,
               })
             );
+
+            // Debounce/aggregate final transcripts before sending to brain
+            if (isFinal) {
+              const alt = msg?.channel?.alternatives?.[0];
+              const text: string = (alt?.transcript ?? "").trim();
+              if (!text) return;
+
+              state.pendingText = state.pendingText
+                ? `${state.pendingText} ${text}`
+                : text;
+              if (state.debounce) clearTimeout(state.debounce);
+
+              state.debounce = setTimeout(() => {
+                const combined = (state.pendingText || "").trim();
+                state.pendingText = "";
+
+                if (!combined) return;
+                const brainUrl =
+                  process.env.BRAIN_URL ?? "http://127.0.0.1:8090/parse";
+
+                postJsonAndReturn(brainUrl, {
+                  text: combined,
+                  session_id: undefined,
+                  context: state.context,
+                })
+                  .then((brainResp) => {
+                    try {
+                      ws.send(
+                        JSON.stringify({ type: "intent", payload: brainResp })
+                      );
+                      if (brainResp?.tts_summary) {
+                        ws.send(
+                          JSON.stringify({
+                            type: "tts",
+                            payload: brainResp.tts_summary,
+                          })
+                        );
+                      }
+                      if (
+                        brainResp?.context_updates &&
+                        typeof brainResp.context_updates === "object"
+                      ) {
+                        state.context = {
+                          ...state.context,
+                          ...brainResp.context_updates,
+                        };
+                      }
+                    } catch {}
+                  })
+                  .catch((e) =>
+                    console.error("[voice] brain post failed:", e?.message || e)
+                  );
+              }, 1000); // 1s debounce window
+            }
           },
-          // onState
+          // onState from Deepgram
           (type, info) => {
             if (!state.closed) {
               ws.send(
@@ -82,6 +180,7 @@ export async function startVoiceServer(opts?: {
             }
           }
         );
+
         ws.send(
           JSON.stringify({ type: "info", payload: "deepgram_connected" })
         );
@@ -101,37 +200,46 @@ export async function startVoiceServer(opts?: {
     }
 
     ws.on("message", (data: WebSocket.RawData) => {
-      // Expect raw PCM16 16k mono bytes from the browser UI
       if (Buffer.isBuffer(data)) {
+        // raw PCM16 16k mono audio from browser
         state.dg?.sendAudio(data);
-      } else {
-        // Optional JSON control frames
-        try {
-          const msg = JSON.parse(String(data));
-          if (msg?.type === "close") {
-            state.dg?.close(); // graceful finish()
-            ws.close();
-          }
-        } catch {
-          // ignore non-JSON control messages
+        return;
+      }
+
+      // Optional JSON control frames from client
+      try {
+        const msg = JSON.parse(String(data));
+        if (msg?.type === "close") {
+          state.dg?.close();
+          ws.close();
+        } else if (
+          msg?.type === "context_update" &&
+          msg?.payload &&
+          typeof msg.payload === "object"
+        ) {
+          // allow the client to push context (e.g., current URL once executor is running)
+          state.context = { ...state.context, ...msg.payload };
         }
+      } catch {
+        // ignore non-JSON control messages
       }
     });
 
     ws.on("close", () => {
       state.closed = true;
+      if (state.debounce) clearTimeout(state.debounce);
       state.dg?.close().catch(() => void 0);
       console.log("[voice] client disconnected");
     });
   });
 
   return {
-    http,
+    http: httpServer,
     wss,
     close: () =>
       new Promise<void>((resolve) => {
         wss.close(() => {
-          http.close(() => resolve());
+          httpServer.close(() => resolve());
         });
       }),
   };
