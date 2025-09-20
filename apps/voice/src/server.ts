@@ -61,7 +61,7 @@ export async function startVoiceServer(opts?: {
   port?: number;
   deepgramApiKey?: string | null;
 }): Promise<VoiceServer> {
-  const PORT = Number(opts?.port ?? process.env.VOICE_PORT ?? 7071);
+  const PORT = Number(opts?.port ?? process.env.VOICE_PORT ?? 7072);
   const DEEPGRAM_API_KEY =
     opts?.deepgramApiKey ?? process.env.DEEPGRAM_API_KEY ?? null;
 

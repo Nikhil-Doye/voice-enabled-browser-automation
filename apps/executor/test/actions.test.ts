@@ -1,68 +1,43 @@
-import { describe, it, expect } from "vitest";
-import { parseIntent } from "@voice-web-agent/schemas";
-import { describeIntent, validateNavigate, validateType } from "../src/actions";
+import { describe, it, expect, vi } from "vitest";
+import { runIntents } from "../src/actions";
+import type { Page } from "playwright";
 
-describe("executor actions", () => {
-  it("describeIntent adds target url or selector", () => {
-    const n = parseIntent({
-      intent: "navigate",
-      utterance: "go",
-      confidence: 0.9,
-      target: { url: "https://example.com" },
-    });
-    expect(describeIntent(n)).toContain("https://example.com");
+function makePage(): Page {
+  return {
+    goto: vi.fn(),
+    screenshot: vi.fn().mockResolvedValue(Buffer.from("")),
+    locator: vi.fn() as any,
+    $: vi.fn().mockResolvedValue(null) as any,
+    $$eval: vi.fn().mockResolvedValue([{ title: "X", price: "$9.99" }]) as any,
+    fill: vi.fn() as any,
+    type: vi.fn() as any,
+    click: vi.fn() as any,
+    keyboard: { type: vi.fn(), press: vi.fn() } as any,
+    getByText: vi.fn(() => ({ first: () => ({ click: vi.fn() }) })) as any,
+    waitForSelector: vi.fn() as any,
+    setInputFiles: vi.fn() as any,
+    selectOption: vi.fn() as any,
+    evaluate: vi.fn() as any,
+    goBack: vi.fn() as any,
+    goForward: vi.fn() as any,
+  } as unknown as Page;
+}
 
-    const t = parseIntent({
-      intent: "type",
-      utterance: "type",
-      confidence: 0.9,
-      target: { selector: "#q" },
-      params: { value: "hello" },
-    });
-    expect(describeIntent(t)).toContain("#q");
-  });
-
-  it("validateNavigate requires url", () => {
-    const ok = parseIntent({
-      intent: "navigate",
-      utterance: "go",
-      confidence: 0.9,
-      target: { url: "https://example.com" },
-    });
-    expect(() => validateNavigate(ok)).not.toThrow();
-
-    const bad = parseIntent({
-      intent: "navigate",
-      utterance: "go",
-      confidence: 0.9,
-    });
-    expect(() => validateNavigate(bad)).toThrow();
-  });
-
-  it("validateType requires selector and value", () => {
-    const ok = parseIntent({
-      intent: "type",
-      utterance: "type",
-      confidence: 0.9,
-      target: { selector: "#q" },
-      params: { value: "hi" },
-    });
-    expect(() => validateType(ok)).not.toThrow();
-
-    const noSel = parseIntent({
-      intent: "type",
-      utterance: "type",
-      confidence: 0.9,
-      params: { value: "hi" },
-    });
-    expect(() => validateType(noSel)).toThrow();
-
-    const noVal = parseIntent({
-      intent: "type",
-      utterance: "type",
-      confidence: 0.9,
-      target: { selector: "#q" },
-    });
-    expect(() => validateType(noVal)).toThrow();
+describe("runIntents", () => {
+  it("navigates, waits, extracts table", async () => {
+    const page = makePage();
+    const intents: any[] = [
+      { type: "navigate", args: { url: "https://example.com" } },
+      { type: "wait_for", args: { selector: "#results", timeoutMs: 100 } },
+      {
+        type: "extract_table",
+        target: { selector: "#results" },
+        args: { columns: ["title", "price"], limit: 5 },
+      },
+    ];
+    const res = await runIntents(page, ".tmp", intents as any);
+    expect(res[0].ok).toBe(true);
+    expect(res[2].ok).toBe(true);
+    expect(Array.isArray(res[2].data)).toBe(true);
   });
 });

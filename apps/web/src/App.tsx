@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { IntentReview } from "./components/IntentReview";
 
 type Line = { text: string; final: boolean; kind?: "info" | "warn" | "error" };
 
@@ -131,6 +132,9 @@ function StatusBadge({ connected }: { connected: boolean }) {
 }
 
 export function App() {
+  const [ws, setWs] = useState<WebSocket | null>(null);
+  const [lastIntent, setLastIntent] = useState<any | null>(null);
+  const [info, setInfo] = useState<string>("");
   const [connected, setConnected] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [lines, setLines] = useState<Line[]>([]);
@@ -151,6 +155,32 @@ export function App() {
     lastSend: performance.now(),
     desiredMs: 60,
   });
+
+  useEffect(() => {
+    const socket = new WebSocket("ws://127.0.0.1:7071/stream");
+    setWs(socket);
+
+    socket.addEventListener("message", (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === "intent") {
+          setLastIntent(msg); // keep the whole object; component extracts .payload.intents
+        } else if (msg.type === "info" || msg.type === "tts") {
+          setInfo(
+            typeof msg.payload === "string"
+              ? msg.payload
+              : JSON.stringify(msg.payload)
+          );
+        }
+      } catch {}
+    });
+
+    return () => {
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      socket.close();
+      }
+    }
+  }, []);
 
   useEffect(() => () => stop(), []);
 
@@ -179,7 +209,7 @@ export function App() {
   async function start() {
     const wsUrl =
       (import.meta.env.VITE_VOICE_WS_URL as string) ??
-      "ws://127.0.0.1:7071/stream";
+      "ws://127.0.0.1:7072/stream";
     const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     ws.onopen = () => setConnected(true);
@@ -424,6 +454,7 @@ export function App() {
             Tip: partial lines update in place; final lines are bolded. Use
             “Clear” to reset the panel.
           </div>
+          <IntentReview lastIntent={lastIntent} />
         </aside>
       </main>
     </div>

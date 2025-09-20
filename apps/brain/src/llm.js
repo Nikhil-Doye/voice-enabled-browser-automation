@@ -1,4 +1,8 @@
 import OpenAI from "openai";
+import path from "node:path";
+import dotenv from "dotenv";
+dotenv.config();
+dotenv.config({ path: path.resolve(process.cwd(), "..", "..", ".env") });
 const BASE_URL = process.env.LLM_BASE_URL || "https://api.openai.com";
 const API_KEY = process.env.LLM_API_KEY || "";
 const MODEL = process.env.LLM_MODEL || "gpt-4o-mini";
