@@ -20,7 +20,7 @@ Voice Input → Deepgram STT → LLM Intent Parsing → Browser Automation
 
 ## Features
 
-- **Real-time Speech Recognition** - Powered by Deepgram's Nova-3 model
+- **Real-time Speech Transcription** - Powered by Deepgram's Nova-3 model
 - **Natural Language Intent Parsing** - Uses OpenAI/compatible LLMs to convert speech to browser actions
 - **Universal Browser Automation** - Works across websites with robust selector strategies
 - **Safety Controls** - Automatic execution for safe actions, manual confirmation for risky operations
