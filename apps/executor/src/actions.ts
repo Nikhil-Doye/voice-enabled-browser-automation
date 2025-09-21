@@ -46,33 +46,183 @@ export async function runIntents(
           break;
         }
         case "search": {
-          // Heuristic: focus site search and type query; fallback to general page type
           const q: string = intent.args?.query || "";
           if (!q) throw new Error("search: args.query is required");
-          // Try common search boxes
-          const candidates = [
-            'input[aria-label="Search"]',
-            'input[type="search"]',
-            'input[placeholder*="Search" i]',
+
+          console.log(`[executor] Searching for: "${q}"`);
+
+          // Wait for page to be ready
+          await page.waitForLoadState("domcontentloaded");
+          await page.waitForTimeout(500);
+
+          // Universal search selectors (ordered by specificity/reliability)
+          const searchSelectors = [
+            // Common search input patterns
             'input[name="q"]',
+            'input[name="query"]',
+            'input[name="search"]',
+            'textarea[name="q"]',
+            'textarea[name="query"]',
+            'textarea[name="search"]',
+
+            // ARIA and semantic selectors
+            'input[role="searchbox"]',
+            'textarea[role="searchbox"]',
+            'input[role="combobox"][aria-label*="search" i]',
+            'textarea[role="combobox"][aria-label*="search" i]',
+
+            // Attribute-based selectors
+            'input[type="search"]',
+            'input[aria-label*="search" i]',
+            'textarea[aria-label*="search" i]',
+            'input[placeholder*="search" i]',
+            'textarea[placeholder*="search" i]',
+            'input[title*="search" i]',
+            'textarea[title*="search" i]',
+
+            // Container-based selectors
             '[role="search"] input',
+            '[role="search"] textarea',
+            ".search-box input",
+            ".search-form input",
+            ".search input",
+            "#search input",
+            "#search-box input",
+
+            // Generic fallbacks
+            'input[class*="search" i]',
+            'textarea[class*="search" i]',
           ];
-          let found = false;
-          for (const sel of candidates) {
-            const el = await page.$(sel);
-            if (el) {
-              await el.fill("");
-              await el.type(q, { delay: 20 });
-              await el.press("Enter");
-              found = true;
-              break;
+
+          let searchElement = null;
+          let usedSelector = "";
+
+          // Try to find a search element
+          for (const selector of searchSelectors) {
+            try {
+              const element = await page.$(selector);
+              if (element) {
+                // Check if element is visible and interactable
+                const isVisible = await element.isVisible();
+                const isEnabled = await element.isEnabled();
+
+                if (isVisible && isEnabled) {
+                  searchElement = element;
+                  usedSelector = selector;
+                  console.log(`[executor] Found search element: ${selector}`);
+                  break;
+                }
+              }
+            } catch (e) {
+              // Continue to next selector
+              continue;
             }
           }
-          if (!found) {
-            // type on body + Enter as last resort
-            await page.keyboard.type(q, { delay: 20 });
-            await page.keyboard.press("Enter");
+
+          if (searchElement) {
+            try {
+              // Focus and clear the search element
+              await searchElement.click();
+              await page.waitForTimeout(100);
+
+              // Clear existing content (cross-platform)
+              await searchElement.selectText().catch(() => {}); // Select all text
+              await searchElement.fill(""); // Clear field
+
+              // Type the search query
+              await searchElement.type(q, { delay: 50 });
+
+              // Try different submission methods
+              let submitted = false;
+
+              // Method 1: Press Enter
+              try {
+                await searchElement.press("Enter");
+                submitted = true;
+                console.log(`[executor] Submitted search via Enter key`);
+              } catch (e) {
+                console.log(`[executor] Enter submission failed: ` + e);
+              }
+
+              // Method 2: Look for submit button if Enter didn't work
+              if (!submitted) {
+                const submitSelectors = [
+                  'button[type="submit"]',
+                  'input[type="submit"]',
+                  'button[aria-label*="search" i]',
+                  ".search-button",
+                  ".search-btn",
+                  "#search-button",
+                  '[role="search"] button',
+                ];
+
+                for (const btnSelector of submitSelectors) {
+                  try {
+                    const submitBtn = await page.$(btnSelector);
+                    if (submitBtn && (await submitBtn.isVisible())) {
+                      await submitBtn.click();
+                      submitted = true;
+                      console.log(
+                        `[executor] Submitted search via button: ${btnSelector}`
+                      );
+                      break;
+                    }
+                  } catch (e) {
+                    continue;
+                  }
+                }
+              }
+
+              // Method 3: Submit the form containing the search element
+              if (!submitted) {
+                try {
+                  const formElement = await searchElement.evaluateHandle((el) =>
+                    el.closest("form")
+                  );
+                  if (formElement && formElement.asElement()) {
+                    await formElement.evaluate((form: HTMLFormElement) =>
+                      form.submit()
+                    );
+                    submitted = true;
+                    console.log(
+                      `[executor] Submitted search via form submission`
+                    );
+                  }
+                  await formElement?.dispose();
+                } catch (e: any) {
+                  console.log(
+                    `[executor] Form submission failed: ${e.message}`
+                  );
+                }
+              }
+
+              if (!submitted) {
+                console.log(
+                  `[executor] Warning: Search may not have been submitted properly`
+                );
+              }
+            } catch (e: any) {
+              throw new Error(`Search interaction failed:` + e);
+            }
+          } else {
+            // Ultimate fallback: just type on the page
+            console.log(
+              "[executor] No search element found, using keyboard fallback"
+            );
+            try {
+              await page.keyboard.type(q, { delay: 100 });
+              await page.keyboard.press("Enter");
+              console.log("[executor] Used keyboard fallback for search");
+            } catch (e) {
+              throw new Error(
+                `Could not perform search: no search element found and keyboard fallback failed`
+              );
+            }
           }
+
+          // Wait a moment for potential page navigation/results
+          await page.waitForTimeout(1000);
+
           step.screenshot = await cap("search");
           break;
         }
