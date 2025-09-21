@@ -45,20 +45,14 @@ export const Intent = z
     clarification: z.string().optional(),
 })
     .strict();
-export const ParseRequest = z
+export const ExecuteRequest = z
     .object({
-    text: z.string().min(1, "text is empty"),
     session_id: z.string().optional(),
-    context: z.record(z.any()).default({}),
-})
-    .strict();
-export const ParseResponse = z
-    .object({
-    version: z.literal("1.0"),
     intents: z.array(Intent).min(1),
-    context_updates: z.record(z.any()).default({}),
-    confidence: z.number().min(0).max(1),
-    tts_summary: z.string().optional(),
-    follow_up_question: z.string().nullable().optional(),
+    options: z
+        .object({
+        headless: z.boolean().optional(),
+    })
+        .optional(),
 })
     .strict();

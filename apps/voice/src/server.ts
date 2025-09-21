@@ -61,7 +61,7 @@ export async function startVoiceServer(opts?: {
   port?: number;
   deepgramApiKey?: string | null;
 }): Promise<VoiceServer> {
-  const PORT = Number(opts?.port ?? process.env.VOICE_PORT ?? 7071);
+  const PORT = Number(opts?.port ?? process.env.VOICE_PORT ?? 7072);
   const DEEPGRAM_API_KEY =
     opts?.deepgramApiKey ?? process.env.DEEPGRAM_API_KEY ?? null;
 
@@ -91,6 +91,7 @@ export async function startVoiceServer(opts?: {
     context: Record<string, any>;
     pendingText?: string;
     debounce?: NodeJS.Timeout;
+    sessionId?: string; // Track executor session
   };
 
   wss.on("connection", async (ws: WebSocket) => {
@@ -128,7 +129,7 @@ export async function startVoiceServer(opts?: {
                 : text;
               if (state.debounce) clearTimeout(state.debounce);
 
-              state.debounce = setTimeout(() => {
+              state.debounce = setTimeout(async () => {
                 const combined = (state.pendingText || "").trim();
                 state.pendingText = "";
 
@@ -136,38 +137,95 @@ export async function startVoiceServer(opts?: {
                 const brainUrl =
                   process.env.BRAIN_URL ?? "http://127.0.0.1:8090/parse";
 
-                postJsonAndReturn(brainUrl, {
-                  text: combined,
-                  session_id: undefined,
-                  context: state.context,
-                })
-                  .then((brainResp) => {
-                    try {
-                      ws.send(
-                        JSON.stringify({ type: "intent", payload: brainResp })
-                      );
-                      if (brainResp?.tts_summary) {
-                        ws.send(
-                          JSON.stringify({
-                            type: "tts",
-                            payload: brainResp.tts_summary,
-                          })
-                        );
-                      }
-                      if (
-                        brainResp?.context_updates &&
-                        typeof brainResp.context_updates === "object"
-                      ) {
-                        state.context = {
-                          ...state.context,
-                          ...brainResp.context_updates,
-                        };
-                      }
-                    } catch {}
-                  })
-                  .catch((e) =>
-                    console.error("[voice] brain post failed:", e?.message || e)
+                try {
+                  const brainResp = await postJsonAndReturn(brainUrl, {
+                    text: combined,
+                    session_id: undefined,
+                    context: state.context,
+                  });
+
+                  // Send intent to UI
+                  ws.send(
+                    JSON.stringify({ type: "intent", payload: brainResp })
                   );
+
+                  if (brainResp?.tts_summary) {
+                    ws.send(
+                      JSON.stringify({
+                        type: "tts",
+                        payload: brainResp.tts_summary,
+                      })
+                    );
+                  }
+
+                  // Update context
+                  if (
+                    brainResp?.context_updates &&
+                    typeof brainResp.context_updates === "object"
+                  ) {
+                    state.context = {
+                      ...state.context,
+                      ...brainResp.context_updates,
+                    };
+                  }
+
+                  // AUTO-EXECUTE SAFE INTENTS (NEW INTEGRATION)
+                  if (brainResp?.intents && Array.isArray(brainResp.intents)) {
+                    const intents = brainResp.intents;
+                    const safeIntents = intents.filter(
+                      (intent: any) => !intent.requires_confirmation
+                    );
+
+                    if (safeIntents.length > 0) {
+                      console.log(
+                        `[voice] Auto-executing ${safeIntents.length} safe intents`
+                      );
+
+                      const executorUrl =
+                        process.env.EXECUTOR_URL ?? "http://127.0.0.1:7081";
+                      postJsonAndReturn(`${executorUrl}/execute`, {
+                        session_id: state.sessionId,
+                        intents: safeIntents,
+                      })
+                        .then((execResp) => {
+                          state.sessionId = execResp.session_id;
+                          console.log(
+                            `[voice] Executed ${safeIntents.length} intents successfully`
+                          );
+                          ws.send(
+                            JSON.stringify({
+                              type: "execution_result",
+                              payload: `Executed ${safeIntents.length} actions successfully. Session: ${execResp.session_id}`,
+                            })
+                          );
+                        })
+                        .catch((execError) => {
+                          console.error("[voice] Executor failed:", execError);
+                          ws.send(
+                            JSON.stringify({
+                              type: "execution_error",
+                              payload: `Execution failed: ${String(execError)}`,
+                            })
+                          );
+                        });
+                    }
+
+                    // Handle risky intents that need confirmation
+                    const riskyIntents = intents.filter(
+                      (intent: any) => intent.requires_confirmation
+                    );
+                    if (riskyIntents.length > 0) {
+                      ws.send(
+                        JSON.stringify({
+                          type: "confirmation_required",
+                          payload: `${riskyIntents.length} risky actions require manual confirmation`,
+                        })
+                      );
+                    }
+                  }
+                } catch (e) {
+                  console.error("[voice] brain post failed:", String(e));
+                }
               }, 1000); // 1s debounce window
             }
           },
