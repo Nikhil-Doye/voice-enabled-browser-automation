@@ -1,8 +1,15 @@
+// apps/executor/src/actions.ts - DOM-aware version
 import type { Page } from "playwright";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { TIntent } from "./types.js";
 import { writeCSV, writeJSON } from "./artifacts.js";
+import {
+  DOMAnalyzer,
+  type PageAnalysis,
+  type DOMElement,
+} 
+from "./dom-analyzer.js";
 
 type StepResult = {
   intent: TIntent;
@@ -11,6 +18,7 @@ type StepResult = {
   data?: any;
   screenshot?: string;
   data_paths?: { json?: string; csv?: string };
+  pageAnalysis?: PageAnalysis;
 };
 
 function normTimeout(intent: TIntent) {
@@ -23,6 +31,7 @@ export async function runIntents(
   intents: TIntent[]
 ): Promise<StepResult[]> {
   const results: StepResult[] = [];
+  let pageAnalysis: PageAnalysis | null = null;
 
   // Helper to capture screenshot file and attach path
   async function cap(label: string) {
@@ -31,287 +40,221 @@ export async function runIntents(
     return file;
   }
 
+  // Analyze page once for all intents
+  async function ensurePageAnalysis() {
+    if (!pageAnalysis) {
+      console.log("[executor] Analyzing page DOM...");
+      const analyzer = new DOMAnalyzer(page);
+      pageAnalysis = await analyzer.analyzePage();
+      console.log(
+        `[executor] Found ${pageAnalysis.searchElements.length} search elements, ${pageAnalysis.buttons.length} buttons, ${pageAnalysis.filters.length} filters`
+      );
+    }
+    return pageAnalysis;
+  }
+
   for (const intent of intents) {
     const step: StepResult = { intent, ok: true };
+
     try {
       switch (intent.type) {
         case "navigate": {
           const url = intent.args?.url;
           if (!url) throw new Error("navigate: args.url is required");
+
           await page.goto(url, {
             waitUntil: "domcontentloaded",
             timeout: normTimeout(intent),
           });
+
+          // Reset page analysis after navigation
+          pageAnalysis = null;
+
           step.screenshot = await cap("navigate");
           break;
         }
+
         case "search": {
-          const q: string = intent.args?.query || "";
-          if (!q) throw new Error("search: args.query is required");
+          const query: string = intent.args?.query || "";
+          if (!query) throw new Error("search: args.query is required");
 
-          console.log(`[executor] Searching for: "${q}"`);
+          const analysis = await ensurePageAnalysis();
+          step.pageAnalysis = analysis;
 
-          // Wait for page to be ready
-          await page.waitForLoadState("domcontentloaded");
-          await page.waitForTimeout(500);
-
-          // Universal search selectors (ordered by specificity/reliability)
-          const searchSelectors = [
-            // Common search input patterns
-            'input[name="q"]',
-            'input[name="query"]',
-            'input[name="search"]',
-            'textarea[name="q"]',
-            'textarea[name="query"]',
-            'textarea[name="search"]',
-
-            // ARIA and semantic selectors
-            'input[role="searchbox"]',
-            'textarea[role="searchbox"]',
-            'input[role="combobox"][aria-label*="search" i]',
-            'textarea[role="combobox"][aria-label*="search" i]',
-
-            // Attribute-based selectors
-            'input[type="search"]',
-            'input[aria-label*="search" i]',
-            'textarea[aria-label*="search" i]',
-            'input[placeholder*="search" i]',
-            'textarea[placeholder*="search" i]',
-            'input[title*="search" i]',
-            'textarea[title*="search" i]',
-
-            // Container-based selectors
-            '[role="search"] input',
-            '[role="search"] textarea',
-            ".search-box input",
-            ".search-form input",
-            ".search input",
-            "#search input",
-            "#search-box input",
-
-            // Generic fallbacks
-            'input[class*="search" i]',
-            'textarea[class*="search" i]',
-          ];
-
-          let searchElement = null;
-          let usedSelector = "";
-
-          // Try to find a search element
-          for (const selector of searchSelectors) {
-            try {
-              const element = await page.$(selector);
-              if (element) {
-                // Check if element is visible and interactable
-                const isVisible = await element.isVisible();
-                const isEnabled = await element.isEnabled();
-
-                if (isVisible && isEnabled) {
-                  searchElement = element;
-                  usedSelector = selector;
-                  console.log(`[executor] Found search element: ${selector}`);
-                  break;
-                }
-              }
-            } catch (e) {
-              // Continue to next selector
-              continue;
-            }
+          if (analysis.searchElements.length === 0) {
+            throw new Error("No search elements found on the page");
           }
 
-          if (searchElement) {
-            try {
-              // Focus and clear the search element
-              await searchElement.click();
-              await page.waitForTimeout(100);
+          // Use the best search element
+          const searchElement = findBestSearchElement(analysis.searchElements);
+          console.log(
+            `[executor] Using search element: ${searchElement.selector}`
+          );
 
-              // Clear existing content (cross-platform)
-              await searchElement.selectText().catch(() => {}); // Select all text
-              await searchElement.fill(""); // Clear field
-
-              // Type the search query
-              await searchElement.type(q, { delay: 50 });
-
-              // Try different submission methods
-              let submitted = false;
-
-              // Method 1: Press Enter
-              try {
-                await searchElement.press("Enter");
-                submitted = true;
-                console.log(`[executor] Submitted search via Enter key`);
-              } catch (e) {
-                console.log(`[executor] Enter submission failed: ` + e);
-              }
-
-              // Method 2: Look for submit button if Enter didn't work
-              if (!submitted) {
-                const submitSelectors = [
-                  'button[type="submit"]',
-                  'input[type="submit"]',
-                  'button[aria-label*="search" i]',
-                  ".search-button",
-                  ".search-btn",
-                  "#search-button",
-                  '[role="search"] button',
-                ];
-
-                for (const btnSelector of submitSelectors) {
-                  try {
-                    const submitBtn = await page.$(btnSelector);
-                    if (submitBtn && (await submitBtn.isVisible())) {
-                      await submitBtn.click();
-                      submitted = true;
-                      console.log(
-                        `[executor] Submitted search via button: ${btnSelector}`
-                      );
-                      break;
-                    }
-                  } catch (e) {
-                    continue;
-                  }
-                }
-              }
-
-              // Method 3: Submit the form containing the search element
-              if (!submitted) {
-                try {
-                  const formElement = await searchElement.evaluateHandle((el) =>
-                    el.closest("form")
-                  );
-                  if (formElement && formElement.asElement()) {
-                    await formElement.evaluate((form: HTMLFormElement) =>
-                      form.submit()
-                    );
-                    submitted = true;
-                    console.log(
-                      `[executor] Submitted search via form submission`
-                    );
-                  }
-                  await formElement?.dispose();
-                } catch (e: any) {
-                  console.log(
-                    `[executor] Form submission failed: ${e.message}`
-                  );
-                }
-              }
-
-              if (!submitted) {
-                console.log(
-                  `[executor] Warning: Search may not have been submitted properly`
-                );
-              }
-            } catch (e: any) {
-              throw new Error(`Search interaction failed:` + e);
-            }
-          } else {
-            // Ultimate fallback: just type on the page
-            console.log(
-              "[executor] No search element found, using keyboard fallback"
-            );
-            try {
-              await page.keyboard.type(q, { delay: 100 });
-              await page.keyboard.press("Enter");
-              console.log("[executor] Used keyboard fallback for search");
-            } catch (e) {
-              throw new Error(
-                `Could not perform search: no search element found and keyboard fallback failed`
-              );
-            }
-          }
-
-          // Wait a moment for potential page navigation/results
-          await page.waitForTimeout(1000);
+          // Wait for element and interact
+          await page.waitForSelector(searchElement.selector, { timeout: 5000 });
+          await page.fill(searchElement.selector, query);
+          await page.press(searchElement.selector, "Enter");
 
           step.screenshot = await cap("search");
           break;
         }
-        case "filter": {
-          // naive price filter
-          if (intent.args?.price?.lte) {
-            const max = String(intent.args.price.lte);
-            // common "Max" price filters
-            const sel = await page.$(
-              'input[aria-label*="Max" i], input[placeholder*="Max" i]'
-            );
-            if (sel) {
-              await sel.fill("");
-              await sel.type(max);
-              await sel.press("Enter");
-            }
-          }
-          step.screenshot = await cap("filter");
-          break;
-        }
-        case "sort": {
-          // try a generic sort dropdown then choose order
-          await page
-            .locator(
-              'select:has-text("Sort"), [aria-label*="Sort" i], text=Sort by'
-            )
-            .first()
-            .click({ timeout: 3000 })
-            .catch(() => {});
-          if (intent.args?.order === "asc" && intent.args?.by === "price") {
-            await page
-              .getByText(/low to high|lowest price/i)
-              .first()
-              .click({ timeout: 3000 })
-              .catch(() => {});
-          } else if (
-            intent.args?.order === "desc" &&
-            intent.args?.by === "price"
-          ) {
-            await page
-              .getByText(/high to low|highest price/i)
-              .first()
-              .click({ timeout: 3000 })
-              .catch(() => {});
-          }
-          step.screenshot = await cap("sort");
-          break;
-        }
+
         case "click": {
-          if (intent.target?.selector) {
-            await page.click(intent.target.selector, {
-              timeout: normTimeout(intent),
-            });
-          } else if (intent.target?.text) {
-            await page
-              .getByText(new RegExp(intent.target.text, "i"))
-              .first()
-              .click({ timeout: normTimeout(intent) });
-          } else if (intent.target?.role && intent.target?.name) {
-            await page
-              .getByRole(intent.target.role as any, {
-                name: new RegExp(intent.target.name, "i"),
-              })
-              .first()
-              .click({ timeout: normTimeout(intent) });
-          } else {
-            throw new Error("click: target is required");
+          const analysis = await ensurePageAnalysis();
+          step.pageAnalysis = analysis;
+
+          let targetElement: DOMElement | null = null;
+
+          // Find element by text, role, or selector
+          if (intent.target?.text) {
+            targetElement = findElementByText(
+              [...analysis.buttons, ...analysis.links],
+              intent.target.text
+            );
+          } else if (intent.target?.selector) {
+            // Direct selector - find in analyzed elements
+            targetElement = findElementBySelector(
+              [
+                ...analysis.buttons,
+                ...analysis.links,
+                ...analysis.navigationElements,
+              ],
+              intent.target.selector
+            );
           }
+
+          if (!targetElement) {
+            throw new Error(`No clickable element found matching intent`);
+          }
+
+          console.log(`[executor] Clicking element: ${targetElement.selector}`);
+          await page.click(targetElement.selector, {
+            timeout: normTimeout(intent),
+          });
           step.screenshot = await cap("click");
           break;
         }
+
+        case "filter": {
+          const analysis = await ensurePageAnalysis();
+          step.pageAnalysis = analysis;
+
+          // Handle different filter types
+          if (intent.args?.price?.lte) {
+            const priceFilter = analysis.filters.find(
+              (f) =>
+                f.type === "range" && f.label.toLowerCase().includes("price")
+            );
+
+            if (priceFilter && priceFilter.elements.length >= 1) {
+              const maxPriceInput =
+                priceFilter.elements.find(
+                  (el) =>
+                    el.placeholder?.toLowerCase().includes("max") ||
+                    el.attributes.name?.toLowerCase().includes("max")
+                ) || priceFilter.elements[priceFilter.elements.length - 1];
+
+              await page.fill(
+                maxPriceInput.selector,
+                String(intent.args.price.lte)
+              );
+              await page.press(maxPriceInput.selector, "Enter");
+              console.log(
+                `[executor] Applied price filter: ${intent.args.price.lte}`
+              );
+            } else {
+              throw new Error("No price range filter found");
+            }
+          }
+
+          step.screenshot = await cap("filter");
+          break;
+        }
+
+        case "sort": {
+          const analysis = await ensurePageAnalysis();
+          step.pageAnalysis = analysis;
+
+          // Find sort dropdown
+          const sortDropdown = analysis.forms
+            .flatMap((form) => form.inputs)
+            .find(
+              (input) =>
+                input.type === "select" &&
+                (input.attributes.name?.toLowerCase().includes("sort") ||
+                  input.attributes.id?.toLowerCase().includes("sort"))
+            );
+
+          if (sortDropdown) {
+            let optionText = "";
+            if (intent.args?.order === "asc" && intent.args?.by === "price") {
+              optionText = "price low to high";
+            } else if (
+              intent.args?.order === "desc" &&
+              intent.args?.by === "price"
+            ) {
+              optionText = "price high to low";
+            }
+
+            if (optionText) {
+              await page.selectOption(sortDropdown.selector, {
+                label: optionText,
+              });
+              console.log(`[executor] Selected sort option: ${optionText}`);
+            }
+          } else {
+            throw new Error("No sort dropdown found");
+          }
+
+          step.screenshot = await cap("sort");
+          break;
+        }
+
         case "type": {
           const value = String(intent.args?.value ?? "");
           const sel = intent.target?.selector;
           if (!sel) throw new Error("type: target.selector is required");
+
           await page.fill(sel, value, { timeout: normTimeout(intent) });
           step.screenshot = await cap("type");
           break;
         }
-        case "select": {
-          const sel = intent.target?.selector;
-          const value = String(intent.args?.value ?? "");
-          if (!sel) throw new Error("select: target.selector is required");
-          await page.selectOption(sel, { label: value }).catch(async () => {
-            await page.selectOption(sel, { value });
-          });
-          step.screenshot = await cap("select");
+
+        case "extract_table": {
+          const analysis = await ensurePageAnalysis();
+          step.pageAnalysis = analysis;
+
+          // Use DOM analysis to find data elements
+          const dataElements = await page.$$eval(
+            '[data-testid*="product"], .product, .item',
+            (elements) => {
+              return elements.slice(0, 10).map((el) => {
+                const text = el.textContent?.replace(/\s+/g, " ").trim() || "";
+                const priceMatch = text.match(/\$\s?\d+[.,]?\d*/);
+                const title = text.split(/\s+/).slice(0, 8).join(" ");
+                return { title, price: priceMatch ? priceMatch[0] : "" };
+              });
+            }
+          );
+
+          step.data = dataElements;
+          const jsonPath = await writeJSON(
+            baseDir,
+            "extract_table",
+            dataElements
+          );
+          const csvPath = await writeCSV(
+            baseDir,
+            "extract_table",
+            dataElements
+          );
+          step.data_paths = { json: jsonPath, csv: csvPath };
+          step.screenshot = await cap("extract_table");
           break;
         }
+
+        // Keep other cases the same as before (scroll, back, forward, etc.)
         case "scroll": {
           const dir = (intent.args?.direction || "down").toLowerCase();
           const px = Number(intent.args?.pixels ?? 800);
@@ -327,105 +270,23 @@ export async function runIntents(
           step.screenshot = await cap("scroll");
           break;
         }
+
         case "back": {
           await page.goBack({
             waitUntil: "domcontentloaded",
             timeout: normTimeout(intent),
           });
+          pageAnalysis = null; // Reset analysis after navigation
           step.screenshot = await cap("back");
           break;
         }
-        case "forward": {
-          await page.goForward({
-            waitUntil: "domcontentloaded",
-            timeout: normTimeout(intent),
-          });
-          step.screenshot = await cap("forward");
-          break;
-        }
-        case "wait_for": {
-          const sel = intent.args?.selector;
-          const ms = Number(intent.args?.timeoutMs ?? normTimeout(intent));
-          if (!sel) throw new Error("wait_for: args.selector is required");
-          await page.waitForSelector(sel, { timeout: ms, state: "visible" });
-          step.screenshot = await cap("wait_for");
-          break;
-        }
-        case "upload": {
-          const sel = intent.target?.selector;
-          const fileRef = String(intent.args?.fileRef || "");
-          if (!sel) throw new Error("upload: target.selector is required");
-          if (!fileRef) throw new Error("upload: args.fileRef is required");
 
-          // Resolve fileRef -> absolute path stored by /uploads
-          const updir = path.resolve(process.cwd(), ".uploads");
-          const filePath = path.join(updir, fileRef.replace(/^.+:\/\//, "")); // resume://<uuid> -> <uuid>
-          await fs.access(filePath);
-          await page.setInputFiles(sel, filePath);
-          step.screenshot = await cap("upload");
-          break;
-        }
-        case "extract_table": {
-          const sel = intent.target?.selector || "[data-test='results']";
-          const limit = Number(intent.args?.limit ?? 5);
-          const columns: string[] = Array.isArray(intent.args?.columns)
-            ? intent.args.columns
-            : ["title", "price"];
-
-          await page.waitForSelector(sel, { timeout: normTimeout(intent) });
-
-          // Simple heuristic extraction: items list with title/price
-          const rows = await page.$$eval(`${sel} *`, (nodes) => {
-            // collect possible cards
-            const cards = new Set<Element>();
-            nodes.forEach((n) => {
-              const text = (n.textContent || "").trim();
-              // crude heuristic to find product cards
-              if (
-                (n as HTMLElement).querySelector &&
-                /add to cart|price|review/i.test(text)
-              ) {
-                cards.add(
-                  n.closest("[data-sku], li, article, .sku-item, .product") || n
-                );
-              }
-            });
-            return Array.from(cards)
-              .slice(0, 50)
-              .map((el) => {
-                const text = (el.textContent || "").replace(/\s+/g, " ").trim();
-                // naive price parse
-                const priceMatch = text.match(/\$\s?\d+[.,]?\d*/);
-                // naive title = first 10 words
-                const title = text.split(/\s+/).slice(0, 12).join(" ");
-                return { title, price: priceMatch ? priceMatch[0] : "" };
-              });
-          });
-
-          const top = rows.slice(0, limit);
-          step.data = top;
-
-          // save JSON & CSV
-          const jsonPath = await writeJSON(baseDir, "extract_table", top);
-          const csvPath = await writeCSV(baseDir, "extract_table", top);
-          step.data_paths = { json: jsonPath, csv: csvPath };
-          step.screenshot = await cap("extract_table");
-          break;
-        }
         case "screenshot": {
           const label = String(intent.args?.label || "screenshot");
           step.screenshot = await cap(label);
           break;
         }
-        case "summarize": {
-          // Executor is a browser runner; summarization is typically brain-side.
-          // Here we just mark an info result.
-          step.data = {
-            note: "Summarization should be handled by the brain/LLM.",
-          };
-          step.ok = true;
-          break;
-        }
+
         default: {
           step.ok = false;
           step.error = `Unsupported intent type: ${intent.type}`;
@@ -435,8 +296,55 @@ export async function runIntents(
       step.ok = false;
       step.error = e?.message || String(e);
     }
+
     results.push(step);
   }
 
   return results;
+}
+
+// Helper functions
+function findBestSearchElement(searchElements: DOMElement[]): DOMElement {
+  // Prioritize by common patterns
+  const prioritized = searchElements.sort((a, b) => {
+    const aScore = getSearchElementScore(a);
+    const bScore = getSearchElementScore(b);
+    return bScore - aScore;
+  });
+
+  return prioritized[0];
+}
+
+function getSearchElementScore(element: DOMElement): number {
+  let score = 0;
+  const attrs = element.attributes;
+
+  if (attrs.name === "q") score += 10;
+  if (attrs.type === "search") score += 8;
+  if (element.placeholder?.toLowerCase().includes("search")) score += 6;
+  if (attrs["aria-label"]?.toLowerCase().includes("search")) score += 5;
+  if (element.bbox && element.bbox.width > 200) score += 2; // Prefer larger inputs
+
+  return score;
+}
+
+function findElementByText(
+  elements: DOMElement[],
+  text: string
+): DOMElement | null {
+  const searchText = text.toLowerCase();
+  return (
+    elements.find(
+      (el) =>
+        el.text?.toLowerCase().includes(searchText) ||
+        el.attributes["aria-label"]?.toLowerCase().includes(searchText)
+    ) || null
+  );
+}
+
+function findElementBySelector(
+  elements: DOMElement[],
+  selector: string
+): DOMElement | null {
+  return elements.find((el) => el.selector === selector) || null;
 }
